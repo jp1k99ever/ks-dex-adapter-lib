@@ -157,6 +157,36 @@ contract EverlongAdaptersAdversarialTest is Test {
     reb2.executeEverlongRebalancer(
       abi.encode(SWAPPER, HONEY, uint256(0), uint256(0), MATH, RATIO), 1e18, NECT, WBTC, recipient
     );
+
+    // The PSM always mints its own debt token, whatever tokenOut claims.
+    EverlongPsmAdapter psm = new EverlongPsmAdapter();
+    deal(HONEY, address(psm), 1e18);
+    vm.expectRevert(EverlongPsmAdapter.EverlongPsmAdapter_TokenMismatch.selector);
+    psm.executeEverlongPsm(abi.encode(PSM, NECT), 1e18, HONEY, WBTC, recipient);
+
+    // An otherwise valid pair cannot override the PSM's debt token through data word 1.
+    vm.expectRevert(EverlongPsmAdapter.EverlongPsmAdapter_TokenMismatch.selector);
+    psm.executeEverlongPsm(abi.encode(PSM, HONEY), 1e18, HONEY, NECT, recipient);
+
+    // The reverse direction must name the real debt token as input too.
+    vm.expectRevert(EverlongPsmAdapter.EverlongPsmAdapter_TokenMismatch.selector);
+    psm.executeEverlongPsm(abi.encode(PSM, NECT), 1e18, WBTC, HONEY, recipient);
+  }
+
+  /// @dev A forged debt-token word used to select redeem, making the real PSM burn NECT
+  /// already held by the adapter while the call claimed HONEY as its input. Binding word
+  /// 1 to debtToken() must stop the call before the residual balance can move.
+  function test_psmForgedDirectionCannotBurnResidualDebt() public {
+    EverlongPsmAdapter adapter = new EverlongPsmAdapter();
+    uint256 residualDebt = 10e18;
+    deal(NECT, address(adapter), residualDebt);
+    uint256 recipientHoneyBefore = IERC20(HONEY).balanceOf(recipient);
+
+    vm.expectRevert(EverlongPsmAdapter.EverlongPsmAdapter_TokenMismatch.selector);
+    adapter.executeEverlongPsm(abi.encode(PSM, HONEY), residualDebt, HONEY, HONEY, recipient);
+
+    assertEq(IERC20(NECT).balanceOf(address(adapter)), residualDebt, 'residual debt must not burn');
+    assertEq(IERC20(HONEY).balanceOf(recipient), recipientHoneyBefore, 'no stable may pay out');
   }
 
   /// @dev A token the venue does not trade is never misrouted: the cvamm adapter treats

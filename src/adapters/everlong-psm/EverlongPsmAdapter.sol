@@ -18,12 +18,14 @@ import '../../libraries/TokenHelper.sol';
 /// the adapter clamps the input to the live bounds first and reports the remainder as
 /// `amountUnused` — mirroring the kyberswap-dex-lib simulator's partial-fill quoting.
 ///
-/// `data` layout: word 0 = PSM address, word 1 = debt token address.
+/// `data` layout: word 0 = PSM address, word 1 = debt token address (verified against
+/// `PSM.debtToken()`).
 contract EverlongPsmAdapter {
   using TokenHelper for address;
   using CalldataDecoder for bytes;
 
   error EverlongPsmAdapter_NothingToFill();
+  error EverlongPsmAdapter_TokenMismatch();
 
   uint16 private constant MAX_FEE_BP = type(uint16).max; // route-level minReturn guards slippage
 
@@ -35,9 +37,17 @@ contract EverlongPsmAdapter {
     address recipient
   ) external payable returns (uint256 amountUnused, uint256 amountOut) {
     IPermissionlessPSM psm = IPermissionlessPSM(data.decodeAddress(0));
-    address debt = data.decodeAddress(1);
+    address debt = psm.debtToken();
+    if (data.decodeAddress(1) != debt) revert EverlongPsmAdapter_TokenMismatch();
 
-    if (tokenIn == debt) {
+    // Exactly one leg must be the PSM's own debt token. The opposite leg is checked
+    // against `stables` below, so calldata cannot select the redeem path and make the
+    // PSM burn residual debt while claiming some unrelated token as the input.
+    bool debtIn = tokenIn == debt && tokenOut != debt;
+    bool debtOut = tokenOut == debt && tokenIn != debt;
+    if (!debtIn && !debtOut) revert EverlongPsmAdapter_TokenMismatch();
+
+    if (debtIn) {
       // debt -> stable: clamp to the book, to what the PSM can pay out, to the cap
       // hook's single-swap exit ceiling, and to the wadOffset floor (sub-offset dust
       // would burn for zero stable). `_bookBurn` reverts PassedOutflowCap past the hook,
