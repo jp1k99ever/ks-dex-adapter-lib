@@ -10,6 +10,9 @@ import '../../libraries/TokenHelper.sol';
 /// directly against the CvammALM. The venue treats `amountIn` as a maximum — dust below
 /// the curve's normalized resolution and anything beyond the solvency clamp is left
 /// unspent — so partial fills surface naturally through `amountUnused`.
+/// The venue-level minimum output is `1`, because the production route executor enforces
+/// the user's aggregate `minReturn`. A direct adapter call has no meaningful per-venue
+/// slippage protection.
 contract EverlongCvammAdapter {
   using TokenHelper for address;
   using CalldataDecoder for bytes;

@@ -125,30 +125,17 @@ contract EverlongRebalancerAdapterTest is Test {
       bytes memory data =
         abi.encode(SWAPPER, NECT, f.grossStableIn, f.netStableIn, MATH, LEVERAGE_RATIO_WAD);
 
-      // production: the route delivers the quoted net plus the wei of headroom the
-      // simulator asks for, and the quoted gross settles verbatim
+      // Production: the route delivers the simulator's exact physical net and the
+      // quoted gross settles verbatim. No synthetic headroom belongs in amountIn.
       vm.createSelectFork(RPC_URL, f.fillBlock - 1);
       EverlongRebalancerAdapter adapter = new EverlongRebalancerAdapter();
-      deal(NECT, address(adapter), f.netStableIn + 1);
+      deal(NECT, address(adapter), f.netStableIn);
       (uint256 amountUnused, uint256 amountOut) =
-        adapter.executeEverlongRebalancer(data, f.netStableIn + 1, NECT, WBTC, recipient);
+        adapter.executeEverlongRebalancer(data, f.netStableIn, NECT, WBTC, recipient);
 
       assertEq(amountOut, f.volatileOut, 'volatile out must match the settled fill');
-      assertLe(amountUnused, 1, 'the quoted net is spent, the headroom wei refunds');
+      assertEq(amountUnused, 0, 'the physical net quote must be consumed exactly');
       assertEq(WBTC.balanceOf(recipient), amountOut);
-
-      // exactly the quoted net, no headroom: the hint no longer fits strictly, so the
-      // gross re-derives a hair under it — it must still fill, never revert
-      vm.createSelectFork(RPC_URL, f.fillBlock - 1);
-      adapter = new EverlongRebalancerAdapter();
-      deal(NECT, address(adapter), f.netStableIn);
-      (uint256 exactUnused, uint256 exactOut) =
-        adapter.executeEverlongRebalancer(data, f.netStableIn, NECT, WBTC, recipient);
-      assertGt(exactOut, 0, 'exact-net funding must fill');
-      assertLe(exactOut, f.volatileOut);
-      assertGe(
-        (f.netStableIn - exactUnused) * 1e6 / f.netStableIn, 999_999, 'within a rounding step'
-      );
 
       // Overfunded, from a FRESH fork: the run above settles a real deleverage and moves
       // the curve, so the surplus case has to start from the same pre-fill state.
@@ -259,29 +246,42 @@ contract EverlongRebalancerAdapterTest is Test {
     assertEq(IERC20(WBTC).allowance(address(adapter), SWAPPER), 0);
   }
 
-  /// @dev Exact-net funding — what a router sends for a quoted (gross, net) — must fill.
-  /// The ALM floors its accounted and idle legs separately, so the stable it releases
-  /// can land a wei under the swapper's preview and the flash repayment reverts on an
-  /// exactly-sized call; the adapter keeps a wei of headroom instead of trusting it.
+  /// @dev Exact physical-net funding — what a router sends for a quoted (gross, net) —
+  /// must fill with zero remainder. Discover the physical net from one execution, then
+  /// replay the same state with exactly that amount; the aggregate reserve preview is
+  /// intentionally not treated as an execution-exact substitute.
   function test_deleverageExactNetFundingFills() public {
     vm.createSelectFork(RPC_URL, PINNED_BLOCK);
     uint256 quotedGross = 20e18;
-    uint256 quotedNet = _netFor(quotedGross);
-    assertGt(quotedNet, 0);
+    uint256 previewNet = _netFor(quotedGross);
+    assertGt(previewNet, 0);
+
+    uint256 snapshot = vm.snapshotState();
+    EverlongRebalancerAdapter probe = new EverlongRebalancerAdapter();
+    deal(NECT, address(probe), quotedGross);
+    (uint256 probeUnused,) = probe.executeEverlongRebalancer(
+      abi.encode(SWAPPER, NECT, quotedGross, previewNet, MATH, LEVERAGE_RATIO_WAD),
+      quotedGross,
+      NECT,
+      WBTC,
+      recipient
+    );
+    uint256 physicalNet = quotedGross - probeUnused;
+    assertGt(physicalNet, 0);
+    vm.revertToState(snapshot);
 
     EverlongRebalancerAdapter adapter = new EverlongRebalancerAdapter();
-    deal(NECT, address(adapter), quotedNet);
+    deal(NECT, address(adapter), physicalNet);
     (uint256 amountUnused, uint256 amountOut) = adapter.executeEverlongRebalancer(
-      abi.encode(SWAPPER, NECT, quotedGross, quotedNet, MATH, LEVERAGE_RATIO_WAD),
-      quotedNet,
+      abi.encode(SWAPPER, NECT, quotedGross, physicalNet, MATH, LEVERAGE_RATIO_WAD),
+      physicalNet,
       NECT,
       WBTC,
       recipient
     );
 
     assertGt(amountOut, 0, 'exact-net funding must fill');
-    assertLt(quotedNet - amountUnused, quotedNet, 'a wei of headroom must survive');
-    assertGe((quotedNet - amountUnused) * 1e6 / quotedNet, 999_999, 'and only a wei-scale one');
+    assertEq(amountUnused, 0, 'physical net funding must not manufacture a remainder');
     assertEq(IERC20(NECT).allowance(address(adapter), SWAPPER), 0);
   }
 
@@ -318,7 +318,7 @@ contract EverlongRebalancerAdapterTest is Test {
   /// @dev Regression: a partial fill (runtime amount below the quoted net) used to rescale
   /// the gross linearly, which the bonding curve and the recycled stable leg make wrong —
   /// at this state that lands 0.78% past the net cap.
-  function test_deleveragePartialUsesExactGross() public {
+  function test_deleveragePartialUsesCurveGross() public {
     vm.createSelectFork(RPC_URL, PINNED_BLOCK);
 
     uint256 quotedGross = 20e18;
@@ -341,11 +341,11 @@ contract EverlongRebalancerAdapterTest is Test {
     uint256 netSpent = amountIn - amountUnused;
     assertLe(netSpent, amountIn, 'never spend past the budget');
 
-    // The linear step lands OVER the cap here, which is the failure the exact
-    // derivation removes; the exact gross consumes the budget to within a rounding step.
+    // The linear step lands OVER the cap here. The bounded curve derivation removes that
+    // failure and consumes the budget to within its documented recovery tolerance.
     uint256 linearNet = _netFor(quotedGross * amountIn / quotedNet);
     assertGt(linearNet, amountIn, 'linear rescale must overshoot, else this proves nothing');
-    assertGe(netSpent * 1e6 / amountIn, 999_999, 'exact sizing must consume the budget');
+    assertGe(netSpent * 1e6 / amountIn, 999_999, 'recovery sizing must consume the budget');
   }
 
   /// @dev Worst-case gas probe: hint-free leverage across sizes up to the venue's max
@@ -598,9 +598,9 @@ contract EverlongRebalancerAdapterTest is Test {
     assertEq(IERC20(WBTC).allowance(address(adapter), SWAPPER), 0);
   }
 
-  /// @dev A zero ratio word falls back to the library constant rather than zeroing every
-  /// math answer (which would have returned the raw budget blindly).
-  function test_deleverageZeroRatioWordFallsBack() public {
+  /// @dev The math address and ratio are version tags, not route-selectable behavior.
+  /// A missing ratio fails closed instead of silently selecting a fallback.
+  function test_deleverageZeroRatioWordReverts() public {
     vm.createSelectFork(RPC_URL, PINNED_BLOCK);
     uint256 quotedGross = 20e18;
     uint256 quotedNet = _netFor(quotedGross);
@@ -608,14 +608,15 @@ contract EverlongRebalancerAdapterTest is Test {
 
     EverlongRebalancerAdapter adapter = new EverlongRebalancerAdapter();
     deal(NECT, address(adapter), amountIn);
-    (uint256 amountUnused, uint256 amountOut) = adapter.executeEverlongRebalancer(
+    vm.expectRevert(
+      EverlongRebalancerAdapter.EverlongRebalancerAdapter_MathVersionMismatch.selector
+    );
+    adapter.executeEverlongRebalancer(
       abi.encode(SWAPPER, NECT, quotedGross, quotedNet, MATH, uint256(0)),
       amountIn,
       NECT,
       WBTC,
       recipient
     );
-    assertGt(amountOut, 0);
-    assertGe((amountIn - amountUnused) * 1e6 / amountIn, 999_999, 'exact sizing must still run');
   }
 }

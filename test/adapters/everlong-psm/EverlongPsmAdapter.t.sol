@@ -131,6 +131,7 @@ contract EverlongPsmAdapterTest is Test {
     assertEq(amountOut, expectedOut, 'deposit out must match the venue preview');
     assertEq(amountUnused, 0, 'nothing to return inside the mint room');
     assertEq(IERC20(NECT).balanceOf(recipient), amountOut, 'recipient must receive the debt token');
+    assertEq(IERC20(HONEY).allowance(address(adapter), PSM), 0, 'full fill clears allowance');
   }
 
   /// @dev Regression: clamping on `mintCap` alone overshoots a tighter hook ceiling and
@@ -154,6 +155,7 @@ contract EverlongPsmAdapterTest is Test {
     assertGt(amountOut, 0, 'must partial-fill, not revert');
     assertEq(amountUnused, amountIn - room, 'unused must be the input past the hook ceiling');
     assertLe(amountOut, room, 'the fill must fit the ceiling the PSM enforces');
+    assertEq(IERC20(HONEY).allowance(address(adapter), PSM), 0, 'partial fill clears allowance');
   }
 
   /// @dev Regression: clamping the burn on `debtTokenMinted` alone ignores the reserve,

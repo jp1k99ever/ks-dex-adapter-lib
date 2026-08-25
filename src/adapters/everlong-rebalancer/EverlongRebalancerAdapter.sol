@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
+import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
+
 import './ICollateralRebalancer.sol';
 import './ICollateralRebalancerSwapper.sol';
 
@@ -36,36 +38,46 @@ import '../../libraries/TokenHelper.sol';
 /// only the quoting simulator evaluates that. A router funds the quoted lot and carries
 /// the rest as RemainingTokenAmountIn.
 ///
-/// Deleverage is sized to leave ONE WEI of the budget unspent. The swapper previews the
-/// released legs off the ALM's combined totals, but the ALM's withdraw floors the
-/// accounted and idle parts separately, so the stable it physically releases can land a
-/// wei under the preview — and the swapper's flash repayment, sized off the preview,
-/// then reverts Slippage on an exactly-funded call. The wei of headroom absorbs it.
+/// A fresh deleverage quote carries the exact physical net stable input and its gross
+/// debt lot. That path accepts exact funding and reports RemainingTokenAmountIn without
+/// synthetic headroom. Missing or stale hints fall back to on-chain sizing against the
+/// swapper's aggregate reserve preview; because physical withdrawal floors reserve
+/// buckets independently, only that recovery path deliberately keeps one wei of budget
+/// headroom and can leave additional rounding dust.
 ///
-/// `data` layout (all hints optional — zero falls back to on-chain derivation):
+/// The venue-level output bounds below are `1`, because the production route executor
+/// enforces the user's aggregate `minReturn`. Calling this adapter outside that executor
+/// provides no meaningful per-venue slippage protection.
+///
+/// `data` layout:
 ///   word 0: swapper address
 ///   word 1: stable token address (the CDP debt token)
 ///   word 2: leverage: quoted CollVault shares (posted as-is when they still fit, and
-///           the ceiling of the search when they do not);
-///           deleverage: quoted gross stableDebtIn
-///   word 3: deleverage: quoted net stable in (the budget reference); leverage: unused
-///   word 4: deleverage: CollRebalancerMath address (exact re-derivation); leverage: unused
-///   word 5: deleverage: the leverage ratio that math validates against (zero = the
-///           library constant); leverage: unused
+///           the ceiling of the search when they do not; zero derives on-chain);
+///           deleverage: quoted gross stableDebtIn (zero enters recovery sizing)
+///   word 3: deleverage: exact quoted PHYSICAL net stable input (zero enters recovery
+///           sizing); leverage: unused
+///   word 4: deleverage: required math-version tag, pinned below; leverage: unused
+///   word 5: deleverage: required leverage-ratio tag, pinned below; leverage: unused
 contract EverlongRebalancerAdapter {
   using TokenHelper for address;
   using CalldataDecoder for bytes;
 
   error EverlongRebalancerAdapter_NothingToFill();
+  error EverlongRebalancerAdapter_MathVersionMismatch();
   error EverlongRebalancerAdapter_TokenMismatch();
 
-  /// @dev Shares live at the CollVault's own scale; the venue's book is far below this.
-  uint256 private constant MAX_SHARES = type(uint128).max;
+  /// @dev CollRebalancerMath rejects collateral/debt above this bound. Applying it to
+  /// local search domains also keeps additions and bisection arithmetic bounded.
+  uint256 private constant MAX_MATH_INPUT = 1e38;
+  uint256 private constant MAX_SHARES = MAX_MATH_INPUT;
 
-  /// @dev CollRebalancerMath.LEVERAGE_RATIO_WAD, the ratio the deployed math validates
-  /// against (floor(4e18 / 9)). Data word 5 may override it; zero falls back here, so a
-  /// quote that omits it cannot silently disable the exact re-derivation.
-  uint256 private constant DEFAULT_LEVERAGE_RATIO_WAD = 444_444_444_444_444_444;
+  /// @dev Version pin for the reviewed Berachain deployment. The core implementation
+  /// links this exact CollRebalancerMath runtime and validates floor(4e18 / 9). Words
+  /// 4/5 remain in calldata as explicit tags, but cannot select arbitrary executable
+  /// math. A core/library upgrade requires a reviewed adapter version (or delisting).
+  address private constant COLL_REBALANCER_MATH = 0x4eBD7A6543Ace6076F089082931c380a3675bC5c;
+  uint256 private constant LEVERAGE_RATIO_WAD = 444_444_444_444_444_444;
 
   /// @dev Cap on exact net evaluations when re-deriving the deleverage gross. A seeded
   /// step converges in one or two; the hint-free path starts at `budget` — low by the
@@ -97,30 +109,29 @@ contract EverlongRebalancerAdapter {
     ICollateralRebalancerSwapper swapper,
     uint256 budget,
     uint256 grossHint,
-    uint256 netHint,
-    ICollRebalancerMath math,
-    uint256 leverageRatioWad
+    uint256 netHint
   ) private view returns (uint256) {
     ICollateralRebalancer.ExchangeState memory st =
       ICollateralRebalancer(swapper.core()).exchangeState();
 
-    if (budget < 2) return 0; // nothing fits once the wei of headroom is kept
+    if (st.debt == 0 || st.debt > MAX_MATH_INPUT || budget < 2) return 0;
     uint256 target = budget - 1;
+    if (target > st.debt) target = st.debt;
     uint256 best;
     // No gross can exceed the position's debt, so the seed is capped there: it bounds the
     // walk-back for a budget past the book and keeps an absurd hint from overflowing.
     uint256 cand;
     if (netHint == 0 || grossHint == 0 || grossHint >= st.debt) {
-      cand = budget;
+      cand = target;
     } else {
-      cand = grossHint * target / netHint;
+      cand = Math.mulDiv(grossHint, target, netHint);
     }
     if (cand > st.debt) cand = st.debt;
 
     uint256 steps;
     uint256 shrinks;
     while (steps < NET_STEPS && cand != 0) {
-      uint256 net = _netFor(swapper, st, cand, math, leverageRatioWad);
+      uint256 net = _netFor(swapper, st, cand);
       if (net == 0) {
         // unquotable at this size: walk back toward the last feasible point; these
         // draw on MAX_SHRINKS, not on the ratio steps
@@ -133,7 +144,8 @@ contract EverlongRebalancerAdapter {
         if (cand > best) best = cand;
         if (target - net <= budget / NET_ACCURACY) break; // within the accuracy target
       }
-      uint256 next = cand * target / net;
+      uint256 next = Math.mulDiv(cand, target, net);
+      if (next > st.debt) next = st.debt;
       if (next == cand) break;
       cand = next;
     }
@@ -145,13 +157,12 @@ contract EverlongRebalancerAdapter {
   function _netFor(
     ICollateralRebalancerSwapper swapper,
     ICollateralRebalancer.ExchangeState memory st,
-    uint256 gross,
-    ICollRebalancerMath math,
-    uint256 leverageRatioWad
+    uint256 gross
   ) private view returns (uint256) {
-    (uint256 shares,,) = math.deleverageQuote(
-      st.collVaultShares, st.debt, st.reservationValueWad, leverageRatioWad, st.spreadPpm, gross
-    );
+    (uint256 shares,,) = ICollRebalancerMath(COLL_REBALANCER_MATH)
+      .deleverageQuote(
+        st.collVaultShares, st.debt, st.reservationValueWad, LEVERAGE_RATIO_WAD, st.spreadPpm, gross
+      );
     if (shares == 0) return 0;
     (uint256 stableLeg,) = swapper.previewTokenAmounts(shares, false);
     return gross > stableLeg ? gross - stableLeg : 0;
@@ -226,38 +237,26 @@ contract EverlongRebalancerAdapter {
   ) private returns (uint256 amountUnused, uint256 amountOut) {
     uint256 grossHint = data.decodeUint256(2);
     uint256 netHint = data.decodeUint256(3);
-    uint256 leverageRatioWad = data.decodeUint256(5);
-    if (leverageRatioWad == 0) leverageRatioWad = DEFAULT_LEVERAGE_RATIO_WAD;
+    if (
+      data.decodeAddress(4) != COLL_REBALANCER_MATH || data.decodeUint256(5) != LEVERAGE_RATIO_WAD
+    ) revert EverlongRebalancerAdapter_MathVersionMismatch();
     uint256 gross;
     if (grossHint != 0 && netHint != 0 && amountIn >= netHint) {
       // The quote holds only if the position has not moved since. It is keeper-managed,
-      // so verify the hint still fits the budget rather than assuming: a hint whose net
-      // has drifted up to `amountIn` reverts inside the swapper, killing the route, and
-      // exact-net funding — what a router actually sends — has no headroom to absorb it
-      // (strict: the wei of headroom from the contract notice must survive).
+      // so verify the hint still fits the budget rather than assuming. Equality is the
+      // normal production shape: word 3 and amountIn both carry the physical net quoted
+      // by the simulator, with no synthetic +1.
       gross = grossHint;
-      uint256 hintNet = _netFor(
-        swapper,
-        ICollateralRebalancer(swapper.core()).exchangeState(),
-        gross,
-        ICollRebalancerMath(data.decodeAddress(4)),
-        leverageRatioWad
-      );
+      uint256 hintNet =
+        _netFor(swapper, ICollateralRebalancer(swapper.core()).exchangeState(), gross);
       // Zero means the venue no longer quotes the hint at all (past the debt or the
       // curve); that must re-derive too rather than be handed to the swapper.
-      if (hintNet == 0 || hintNet >= amountIn) {
-        gross = 0; // fall through to the exact re-derivation below
+      if (hintNet == 0 || hintNet > amountIn) {
+        gross = 0; // fall through to bounded recovery sizing below
       }
     }
     if (gross == 0) {
-      gross = _grossForNet(
-        swapper,
-        amountIn,
-        grossHint,
-        netHint,
-        ICollRebalancerMath(data.decodeAddress(4)),
-        leverageRatioWad
-      );
+      gross = _grossForNet(swapper, amountIn, grossHint, netHint);
     }
     if (gross == 0) revert EverlongRebalancerAdapter_NothingToFill();
 

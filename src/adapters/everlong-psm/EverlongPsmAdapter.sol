@@ -17,6 +17,9 @@ import '../../libraries/TokenHelper.sol';
 /// The PSM reverts on its mint cap / per-stable accounting instead of truncating, so
 /// the adapter clamps the input to the live bounds first and reports the remainder as
 /// `amountUnused` — mirroring the kyberswap-dex-lib simulator's partial-fill quoting.
+/// `MAX_FEE_BP` deliberately delegates price protection to the production route
+/// executor's aggregate `minReturn`; direct calls have no meaningful adapter-level
+/// minimum output.
 ///
 /// `data` layout: word 0 = PSM address, word 1 = debt token address (verified against
 /// `PSM.debtToken()`).
@@ -28,6 +31,14 @@ contract EverlongPsmAdapter {
   error EverlongPsmAdapter_TokenMismatch();
 
   uint16 private constant MAX_FEE_BP = type(uint16).max; // route-level minReturn guards slippage
+
+  /// @dev A route chooses the PSM and can therefore expose arbitrary values through its
+  /// getters. Capacity products are bounds, so saturation is both fail-safe and avoids
+  /// an arithmetic panic before the real venue call applies its own accounting.
+  function _saturatingMul(uint256 a, uint256 b) private pure returns (uint256) {
+    if (a == 0 || b == 0) return 0;
+    return a > type(uint256).max / b ? type(uint256).max : a * b;
+  }
 
   function executeEverlongPsm(
     bytes calldata data,
@@ -57,7 +68,7 @@ contract EverlongPsmAdapter {
       // of tripping a division-by-zero panic below.
       if (wadOffset == 0) revert EverlongPsmAdapter_NothingToFill();
       uint256 maxIn = psm.debtTokenMinted(tokenOut);
-      uint256 payableIn = psm.availableReserve(tokenOut) * wadOffset;
+      uint256 payableIn = _saturatingMul(psm.availableReserve(tokenOut), wadOffset);
       if (payableIn < maxIn) maxIn = payableIn;
       address hook = psm.capHook();
       if (hook != address(0)) {
@@ -67,10 +78,8 @@ contract EverlongPsmAdapter {
         uint256 hookCeiling = IPsmCapHook(hook).maxRedeem(tokenOut);
         if (hookCeiling < maxIn) maxIn = hookCeiling;
         uint256 outflow = IPsmCapHook(hook).getMaxPsmOutflow(address(this), tokenOut, false);
-        if (outflow < type(uint256).max / wadOffset) {
-          uint256 outflowIn = outflow * wadOffset;
-          if (outflowIn < maxIn) maxIn = outflowIn;
-        }
+        uint256 outflowIn = _saturatingMul(outflow, wadOffset);
+        if (outflowIn < maxIn) maxIn = outflowIn;
       }
       uint256 used = amountIn < maxIn ? amountIn : maxIn;
       used -= used % wadOffset;

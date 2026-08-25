@@ -67,6 +67,67 @@ contract LyingVenue {
 /// @dev A recipient with no receive/fallback: plain ERC-20 output must still land.
 contract DeafRecipient {}
 
+/// @dev Getter products exceed uint256 even though each component is ABI-valid.
+contract OverflowCapacityPsm {
+  address public immutable debtToken;
+  address public immutable stable;
+
+  constructor(address debt_, address stable_) {
+    debtToken = debt_;
+    stable = stable_;
+  }
+
+  function stables(address asset) external view returns (uint64) {
+    return asset == stable ? type(uint64).max : 0;
+  }
+
+  function availableReserve(address) external pure returns (uint256) {
+    return type(uint256).max;
+  }
+
+  function debtTokenMinted(address) external pure returns (uint256) {
+    return type(uint256).max;
+  }
+
+  function capHook() external view returns (address) {
+    return address(this);
+  }
+
+  function maxRedeem(address) external pure returns (uint256) {
+    return type(uint256).max;
+  }
+
+  function getMaxPsmOutflow(address, address, bool) external pure returns (uint256) {
+    return type(uint256).max;
+  }
+
+  function redeem(address, uint256, address, uint16) external pure returns (uint256) {
+    return 1;
+  }
+}
+
+/// @dev An arbitrary core cannot force ratio-step arithmetic outside the reviewed
+/// library's 1e38 input domain.
+contract OversizedRebalancerCore {
+  function exchangeState() external pure returns (ICollateralRebalancer.ExchangeState memory st) {
+    st.collVaultShares = type(uint256).max;
+    st.debt = type(uint256).max;
+    st.reservationValueWad = 1e18;
+  }
+}
+
+contract OversizedRebalancerSwapper {
+  address public immutable core;
+  address public immutable debtToken;
+  address public immutable volatile;
+
+  constructor(address core_, address debt_, address volatile_) {
+    core = core_;
+    debtToken = debt_;
+    volatile = volatile_;
+  }
+}
+
 /// @notice Adversarial cases: the adapters hold no standing funds and take every
 /// address from `data`, so the exposure is (a) a crafted call stealing what the adapter
 /// holds DURING that call — which is the caller's own input — and (b) misrouting on bad
@@ -223,6 +284,57 @@ contract EverlongAdaptersAdversarialTest is Test {
     adapter.executeEverlongPsm(abi.encode(PSM, NECT), 1e18, NECT, WBTC, recipient);
   }
 
+  /// @dev The math address and ratio are reviewed deployment-version tags. Calldata may
+  /// attest to that version, but it cannot select another executable math implementation
+  /// or change the leverage ratio used to size a real swapper call.
+  function test_rebalancerMathVersionTagsFailClosed() public {
+    EverlongRebalancerAdapter adapter = new EverlongRebalancerAdapter();
+    uint256 amountIn = 5e18;
+    deal(NECT, address(adapter), amountIn);
+
+    vm.expectRevert(
+      EverlongRebalancerAdapter.EverlongRebalancerAdapter_MathVersionMismatch.selector
+    );
+    adapter.executeEverlongRebalancer(
+      abi.encode(SWAPPER, NECT, uint256(0), uint256(0), address(1), RATIO),
+      amountIn,
+      NECT,
+      WBTC,
+      recipient
+    );
+
+    vm.expectRevert(
+      EverlongRebalancerAdapter.EverlongRebalancerAdapter_MathVersionMismatch.selector
+    );
+    adapter.executeEverlongRebalancer(
+      abi.encode(SWAPPER, NECT, uint256(0), uint256(0), MATH, RATIO + 1),
+      amountIn,
+      NECT,
+      WBTC,
+      recipient
+    );
+    assertEq(IERC20(NECT).balanceOf(address(adapter)), amountIn, 'failed tags cannot spend input');
+    assertEq(IERC20(NECT).allowance(address(adapter), SWAPPER), 0, 'failed tags leave no approval');
+  }
+
+  /// @dev Exact physical net is a chain fact, not a tolerance. Replaying a settled lot
+  /// with that exact input must report no synthetic one-wei remainder.
+  function test_rebalancerExactPhysicalNetHasZeroUnused() public {
+    vm.createSelectFork(RPC_URL, 24_736_814);
+    EverlongRebalancerAdapter adapter = new EverlongRebalancerAdapter();
+    uint256 gross = 16_116_652_431_195_149_121;
+    uint256 physicalNet = 10_132_227_981_359_897_368;
+    deal(NECT, address(adapter), physicalNet);
+
+    (uint256 amountUnused, uint256 amountOut) = adapter.executeEverlongRebalancer(
+      abi.encode(SWAPPER, NECT, gross, physicalNet, MATH, RATIO), physicalNet, NECT, WBTC, recipient
+    );
+
+    assertEq(amountUnused, 0, 'exact physical net must be exact end-to-end');
+    assertEq(amountOut, 15_707, 'settled volatile output must replay exactly');
+    assertEq(IERC20(NECT).allowance(address(adapter), SWAPPER), 0);
+  }
+
   /// @dev Garbage hints cannot steer the fill: a share hint past the book is ignored as
   /// a seed and, as a cap, can only shrink the lot; a gross hint past the debt (the
   /// venue answers zero for it) must re-derive rather than reach the swapper.
@@ -272,6 +384,36 @@ contract EverlongAdaptersAdversarialTest is Test {
     EverlongPsmAdapter psm = new EverlongPsmAdapter();
     vm.expectRevert(EverlongPsmAdapter.EverlongPsmAdapter_NothingToFill.selector);
     psm.executeEverlongPsm(abi.encode(PSM, NECT), 0, HONEY, NECT, recipient);
+  }
+
+  /// @dev Route-selected getters may return individually valid values whose capacity
+  /// products overflow. Bounds saturate, and oversized rebalancer state fails closed,
+  /// instead of either path panicking in adapter arithmetic.
+  function test_adversarialGetterProductsCannotOverflowAdapterArithmetic() public {
+    OverflowCapacityPsm psmVenue = new OverflowCapacityPsm(NECT, HONEY);
+    EverlongPsmAdapter psm = new EverlongPsmAdapter();
+    uint256 psmAmountIn = type(uint64).max;
+    deal(NECT, address(psm), psmAmountIn);
+    (uint256 psmUnused, uint256 psmOut) = psm.executeEverlongPsm(
+      abi.encode(address(psmVenue), NECT), psmAmountIn, NECT, HONEY, recipient
+    );
+    assertEq(psmUnused, 0);
+    assertEq(psmOut, 1);
+
+    OversizedRebalancerCore oversizedCore = new OversizedRebalancerCore();
+    OversizedRebalancerSwapper oversizedSwapper =
+      new OversizedRebalancerSwapper(address(oversizedCore), NECT, WBTC);
+    EverlongRebalancerAdapter rebalancer = new EverlongRebalancerAdapter();
+    uint256 rebalancerAmountIn = 5e18;
+    deal(NECT, address(rebalancer), rebalancerAmountIn);
+    vm.expectRevert(EverlongRebalancerAdapter.EverlongRebalancerAdapter_NothingToFill.selector);
+    rebalancer.executeEverlongRebalancer(
+      abi.encode(address(oversizedSwapper), NECT, uint256(0), uint256(0), MATH, RATIO),
+      rebalancerAmountIn,
+      NECT,
+      WBTC,
+      recipient
+    );
   }
 
   /// @dev Output to a contract recipient with no receive hook lands like any ERC-20.
